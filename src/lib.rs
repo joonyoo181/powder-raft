@@ -5,6 +5,7 @@ pub mod utils;
 pub mod config;
 // pub mod consensus;
 pub mod consensus;
+pub mod consensus_raft;
 pub mod crypto;
 pub mod rpc;
 // pub mod execution;

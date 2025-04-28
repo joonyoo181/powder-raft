@@ -23,5 +23,7 @@ message ProtoPayload {
 
         proto.checkpoint.ProtoBackfillNack backfill_nack = 7;
 
+        proto.consensus.ProtoRaftAppendEntries raft_append_entries = 8;
+        proto.consensus.ProtoRaftAppendEntriesReply raft_append_entries_reply = 9;
     }
 }

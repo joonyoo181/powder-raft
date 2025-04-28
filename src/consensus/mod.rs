@@ -28,7 +28,7 @@ use pacemaker::Pacemaker;
 use prost::Message;
 use staging::{Staging, VoteWithSender};
 use tokio::{sync::{mpsc::unbounded_channel, Mutex}, task::JoinSet};
-use crate::{proto::{checkpoint::ProtoBackfillNack, consensus::{ProtoAppendEntries, ProtoViewChange}}, rpc::{client::Client, SenderType}, utils::{channel::{make_channel, Receiver, Sender}, RocksDBStorageEngine, StorageService}};
+use crate::{proto::{checkpoint::ProtoBackfillNack, consensus::{ProtoAppendEntries, ProtoRaftAppendEntries, ProtoRaftAppendEntriesReply, ProtoViewChange}}, rpc::{client::Client, SenderType}, utils::{channel::{make_channel, Receiver, Sender}, RocksDBStorageEngine, StorageService}};
 
 use crate::{config::{AtomicConfig, Config}, crypto::{AtomicKeyStore, CryptoService, KeyStore}, proto::rpc::ProtoPayload, rpc::{server::{MsgAckChan, RespType, Server, ServerContextType}, MessageRef}};
 
@@ -143,6 +143,8 @@ impl ServerContextType for PinnedConsensusServerContext {
                             .expect("Channel send error");
                         return Ok(RespType::NoResp);
             },
+            crate::proto::rpc::proto_payload::Message::RaftAppendEntries(proto_raft_append_entries) => {},
+            crate::proto::rpc::proto_payload::Message::RaftAppendEntriesReply(proto_raft_append_entries_reply) => {},
         }
 
 

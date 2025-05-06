@@ -1,4 +1,5 @@
 pub mod batch_proposal;
+mod block_broadcaster;
 pub mod app;
 pub mod engines;
 pub mod client_reply;
@@ -7,10 +8,11 @@ use std::{io::{Error, ErrorKind}, ops::Deref, pin::Pin, sync::Arc};
 
 use app::{AppEngine, Application};
 use batch_proposal::{BatchProposer, TxWithAckChanTag};
+use block_broadcaster::BlockBroadcaster;
 use log::{debug, info, warn};
 use prost::Message;
 use tokio::{sync::{mpsc::unbounded_channel, Mutex}, task::JoinSet};
-use crate::{proto::{checkpoint::ProtoBackfillNack, consensus::{ProtoAppendEntries, ProtoViewChange, ProtoRaftAppendEntries, ProtoRaftAppendEntriesReply}}, rpc::{client::Client, SenderType}, utils::{channel::{make_channel, Receiver, Sender}, RocksDBStorageEngine, StorageService}};
+use crate::{proto::{checkpoint::ProtoBackfillNack, consensus::{ProtoAppendEntries, ProtoViewChange, ProtoRaftAppendEntries, ProtoRaftAppendEntriesReply}}, rpc::{client::Client, SenderType}, utils::{channel::{make_channel, Receiver, Sender}, RocksDBStorageEngine, RaftStorageService}};
 
 use crate::{config::{AtomicConfig, Config}, crypto::{AtomicKeyStore, CryptoService, KeyStore}, proto::rpc::ProtoPayload, rpc::{server::{MsgAckChan, RespType, Server, ServerContextType}, MessageRef}};
 
@@ -118,11 +120,12 @@ pub struct ConsensusNode {
     keystore: AtomicKeyStore,
 
     server: Arc<Server<PinnedConsensusServerContext>>,
-    storage: Arc<Mutex<StorageService<RocksDBStorageEngine>>>,
+    storage: Arc<Mutex<RaftStorageService<RocksDBStorageEngine>>>,
 
     /// This will be owned by the task that runs batch_proposer
     /// So the lock will be taken exactly ONCE and held forever.
     batch_proposer: Arc<Mutex<BatchProposer>>,
+    block_broadcaster: Arc<Mutex<BlockBroadcaster>>,
 
     /// Use this to feed transactions from within the same process.
     pub batch_proposer_tx: Sender<TxWithAckChanTag>,
@@ -153,18 +156,25 @@ impl ConsensusNode {
         let storage = match storage_config {
             rocksdb_config @ crate::config::StorageConfig::RocksDB(_) => {
                 let _db = RocksDBStorageEngine::new(rocksdb_config.clone());
-                StorageService::new(_db, _chan_depth)
+                RaftStorageService::new(_db, _chan_depth)
             },
             crate::config::StorageConfig::FileStorage(_) => {
                 panic!("File storage not supported!");
             },
         };
+        let client = Client::new_atomic(config.clone(), keystore.clone(), false, 0);
 
-        let (block_maker_tx, block_maker_rx) = make_channel(_chan_depth);
+        let (block_broadcaster_tx, block_broadcaster_rx) = make_channel(_chan_depth);
         let (client_reply_command_tx, client_reply_command_rx) = make_channel(_chan_depth);
         let (unlogged_tx, unlogged_rx) = make_channel(_chan_depth);
         let (batch_proposer_command_tx, batch_proposer_command_rx) = make_channel(_chan_depth);
-        let batch_proposer = BatchProposer::new(config.clone(), batch_proposer_rx, block_maker_tx, client_reply_command_tx.clone(), unlogged_tx, batch_proposer_command_rx);
+        let (broadcaster_control_command_tx, broadcaster_control_command_rx) = make_channel(_chan_depth);
+        let (staging_tx, staging_rx) = make_channel(_chan_depth);
+
+        let block_broadcaster_storage = storage.get_connector();
+
+        let batch_proposer = BatchProposer::new(config.clone(), batch_proposer_rx, block_broadcaster_tx, client_reply_command_tx.clone(), unlogged_tx, batch_proposer_command_rx);
+        let block_broadcaster = BlockBroadcaster::new(config.clone(), client.into(), block_broadcaster_rx, broadcaster_control_command_rx, block_broadcaster_storage, staging_tx);
 
         let (raft_ae_tx, raft_ae_rx) = make_channel(_chan_depth);
         let (raft_ae_reply_tx, raft_ae_reply_rx) = make_channel(_chan_depth);
@@ -176,6 +186,7 @@ impl ConsensusNode {
             keystore: keystore.clone(),
             server: Arc::new(Server::new_atomic(config.clone(), ctx, keystore.clone())),
             batch_proposer: Arc::new(Mutex::new(batch_proposer)),
+            block_broadcaster: Arc::new(Mutex::new(block_broadcaster)),
 
             storage: Arc::new(Mutex::new(storage)),
 
@@ -187,6 +198,7 @@ impl ConsensusNode {
         let server = self.server.clone();
         let batch_proposer = self.batch_proposer.clone();
         let storage = self.storage.clone();
+        let block_broadcaster = self.block_broadcaster.clone();
 
         let mut handles = JoinSet::new();
 
@@ -202,6 +214,10 @@ impl ConsensusNode {
         handles.spawn(async move {
             BatchProposer::run(batch_proposer).await;
         });
+
+        // handles.spawn(async move {
+        //     BlockBroadcaster::run(block_broadcaster).await;
+        // });
     
         handles
     }

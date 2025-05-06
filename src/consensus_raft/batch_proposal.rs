@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::time::Instant;
 use std::{io::Error, pin::Pin, sync::Arc, time::Duration};
 
@@ -12,14 +11,10 @@ use crate::proto::rpc::ProtoPayload;
 use crate::rpc::server::LatencyProfile;
 use crate::rpc::{PinnedMessage, SenderType};
 use crate::utils::channel::{Sender, Receiver};
-use crate::utils::PerfCounter;
 use tokio::sync::{oneshot, Mutex};
 
 use crate::{config::AtomicConfig, utils::timer::ResettableTimer, proto::execution::ProtoTransaction, rpc::server::MsgAckChan};
-
-use super::app::AppCommand;
 use super::client_reply::ClientReplyCommand;
-
 pub type RawBatch = Vec<ProtoTransaction>;
 
 pub type MsgAckChanWithTag = (MsgAckChan, u64 /* client tag */, SenderType /* client name */);
@@ -34,7 +29,8 @@ pub struct BatchProposer {
     config: AtomicConfig,
 
     batch_proposer_rx: Receiver<TxWithAckChanTag>,
-    block_maker_tx: Sender<(RawBatch, Vec<MsgAckChanWithTag>)>,
+    block_broadcaster_tx: Sender<(RawBatch, Vec<MsgAckChanWithTag>)>,
+    // block_broadcaster_tx: Sender<(u64, oneshot::Receiver<CachedBlock>)>
 
     reply_tx: Sender<ClientReplyCommand>,
     unlogged_tx: Sender<(ProtoTransaction, oneshot::Sender<ProtoTransactionResult>)>,
@@ -43,13 +39,10 @@ pub struct BatchProposer {
     current_reply_vec: Vec<MsgAckChanWithTag>,
     batch_timer: Arc<Pin<Box<ResettableTimer>>>,
 
-    perf_counter: RefCell<PerfCounter<usize>>,
-
     make_new_batches: bool,
     current_leader: String,
 
     cmd_rx: Receiver<BatchProposerCommand>,
-
     last_batch_proposed: Instant,
 }
 
@@ -57,7 +50,7 @@ impl BatchProposer {
     pub fn new(
         config: AtomicConfig,
         batch_proposer_rx: Receiver<TxWithAckChanTag>,
-        block_maker_tx: Sender<(RawBatch, Vec<MsgAckChanWithTag>)>,
+        block_broadcaster_tx: Sender<(RawBatch, Vec<MsgAckChanWithTag>)>,
         reply_tx: Sender<ClientReplyCommand>, unlogged_tx: Sender<(ProtoTransaction, oneshot::Sender<ProtoTransactionResult>)>,
         cmd_rx: Receiver<BatchProposerCommand>,
     ) -> Self {
@@ -66,23 +59,19 @@ impl BatchProposer {
         );
 
         let max_batch_size = config.get().consensus_config.max_backlog_batch_size;
-
         let event_order = vec![
             "Add request to batch",
             "Propose batch"
         ];
 
-        let perf_counter = RefCell::new(PerfCounter::new("BatchProposer", &event_order));
-
         #[allow(unused_mut)]
         let mut ret = Self {
             config,
-            batch_proposer_rx, block_maker_tx,
+            batch_proposer_rx, block_broadcaster_tx,
             current_raw_batch: Some(RawBatch::with_capacity(max_batch_size)),
             batch_timer,
             current_reply_vec: Vec::with_capacity(max_batch_size),
             reply_tx, unlogged_tx,
-            perf_counter,
             make_new_batches: false,
             current_leader: String::new(),
             cmd_rx,
@@ -111,54 +100,9 @@ impl BatchProposer {
             }
 
             total_work += 1;
-            if total_work % (1000 * batch_size) == 0 {
-                batch_proposer.perf_counter.borrow().log_aggregate();
-            }
-
         }
 
         batch_timer_handle.abort();
-    }
-
-    fn perf_register_random(&mut self, entry: usize) {
-        #[cfg(not(feature = "perf"))]
-        return;
-
-        #[cfg(feature = "perf")]
-        {
-            let mut batch_size = self.config.get().consensus_config.max_backlog_batch_size;
-            // Randomly decide whether to register the new entry with probability 1/batch_size (approx)
-            // A random sample gives `true` with prob 1/2.
-            // So for n tries 1/2^n <= 1/batch_size or n >= log2(batch_size)
-            // log2(batch_size) is the number of bits needed to express batch_size.
-            // So an approx way to calculate log2(batch_size) is to keep shifting right until batch_size is 0.
-            let mut should_register = true;
-            while batch_size > 0 {
-                batch_size >>= 1;
-                
-                should_register = should_register && rand::random::<bool>();
-            }
-    
-            if !should_register {
-                return;
-            }
-            self.perf_counter.borrow_mut().register_new_entry(entry);
-
-        }
-    }
-
-    fn perf_add_event(&mut self, entry: usize, event: &str) {
-
-        #[cfg(feature = "perf")]
-        self.perf_counter.borrow_mut().new_event(event, &entry);
-    }
-
-    fn perf_event_and_deregister_all(&mut self, event: &str) {
-        #[cfg(feature = "perf")]
-        {
-            self.perf_counter.borrow_mut().new_event_for_all(event);
-            self.perf_counter.borrow_mut().deregister_all();
-        }
     }
 
     async fn worker(&mut self, work_counter: usize) -> Result<(), Error> {
@@ -207,12 +151,9 @@ impl BatchProposer {
                 return Ok(());
             }
 
-            self.perf_register_random(work_counter);
-
             let new_tx = new_tx.unwrap();
             if new_tx.0.is_none() {
                 warn!("Malformed transaction");
-                self.register_reply_malformed(new_tx.1).await;
                 return Ok(());
             }
 
@@ -221,7 +162,6 @@ impl BatchProposer {
 
             self.current_raw_batch.as_mut().unwrap().push(new_tx);
             self.current_reply_vec.push(ack_chan);
-            self.perf_add_event(work_counter, "Add request to batch");
         }
 
         let max_batch_size = self.config.get().consensus_config.max_backlog_batch_size;
@@ -233,11 +173,7 @@ impl BatchProposer {
         Ok(())
     }
 
-    async fn register_reply_malformed(&mut self, ack_chan: MsgAckChanWithTag) {
-        // TODO
-    }
-
-    async fn reply_leader(&mut self, new_tx: TxWithAckChanTag) { // TODO
+    async fn reply_leader(&mut self, new_tx: TxWithAckChanTag) {
         let (ack_chan, client_tag, _) = new_tx.1;
         let node_infos = NodeInfo {
             nodes: self.config.get().net_config.nodes.clone(),
@@ -267,8 +203,7 @@ impl BatchProposer {
             self.config.get().consensus_config.max_backlog_batch_size
         ));
         let reply_chans = self.current_reply_vec.drain(..).collect();
-        let _ = self.block_maker_tx.send((batch, reply_chans)).await;
-        self.perf_event_and_deregister_all("Propose batch");
+        let _ = self.block_broadcaster_tx.send((batch, reply_chans)).await;
         self.batch_timer.reset();
     }
 
@@ -284,7 +219,7 @@ impl BatchProposer {
         let tx = tx.unwrap();
         
         if tx.on_receive.is_some() {
-            if !(tx.on_crash_commit.is_none() && tx.on_byzantine_commit.is_none()) {
+            if !(tx.on_crash_commit.is_none()) {
                 warn!("Malformed transaction");
             }
 
@@ -298,12 +233,9 @@ impl BatchProposer {
             } else {
                 self.reply_tx.send(ClientReplyCommand::ProbeRequestAck(block_n, ack_chan)).await.unwrap();
             }
-                
-
-
+            
             return None;
         }
-
 
         Some((Some(tx), ack_chan))
 

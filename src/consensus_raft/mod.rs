@@ -115,12 +115,26 @@ impl ServerContextType for PinnedConsensusServerContext {
     }
 }
 
+pub struct RaftState {
+    pub current_term: u64,
+    pub voted_for: Option<String>,
+    pub log: Vec<RaftLogEntry>,
+    pub commit_index: u64,
+    pub last_applied: u64,
+}
+
+pub struct RaftLogEntry {
+    pub term: u64,
+    pub block: ProtoBlock,
+}
+
 pub struct ConsensusNode {
     config: AtomicConfig,
     keystore: AtomicKeyStore,
 
     server: Arc<Server<PinnedConsensusServerContext>>,
     storage: Arc<Mutex<RaftStorageService<RocksDBStorageEngine>>>,
+    raft_state: Arc<Mutex<RaftState>>,
 
     /// This will be owned by the task that runs batch_proposer
     /// So the lock will be taken exactly ONCE and held forever.
@@ -189,6 +203,13 @@ impl ConsensusNode {
             block_broadcaster: Arc::new(Mutex::new(block_broadcaster)),
 
             storage: Arc::new(Mutex::new(storage)),
+            raft_state: Arc::new(Mutex::new(RaftState {
+                current_term: 0,
+                voted_for: None,
+                log: vec![],
+                commit_index: 0,
+                last_applied: 0
+            })),
 
             batch_proposer_tx,
         }
@@ -196,6 +217,7 @@ impl ConsensusNode {
 
     pub async fn run(&mut self) -> JoinSet<()> {
         let server = self.server.clone();
+        let raft_state = self.raft_state.clone();
         let batch_proposer = self.batch_proposer.clone();
         let storage = self.storage.clone();
         let block_broadcaster = self.block_broadcaster.clone();
@@ -215,9 +237,9 @@ impl ConsensusNode {
             BatchProposer::run(batch_proposer).await;
         });
 
-        // handles.spawn(async move {
-        //     BlockBroadcaster::run(block_broadcaster).await;
-        // });
+        handles.spawn(async move {
+            BlockBroadcaster::run(block_broadcaster, raft_state).await;
+        });
     
         handles
     }

@@ -61,12 +61,13 @@ impl BlockBroadcaster {
         }
     }
 
-    pub async fn run(block_broadcaster: Arc<Mutex<Self>>) {
+    pub async fn run(block_broadcaster: Arc<Mutex<Self>>, raft_state: Arc<Mutex<RaftState>>) {
         let mut block_broadcaster = block_broadcaster.lock().await;
+        let mut raft_state = raft_state.lock().await;
 
         let mut total_work = 0;
         loop {
-            if let Err(_e) = block_broadcaster.worker().await {
+            if let Err(_e) = block_broadcaster.worker(raft_state).await {
                 break;
             }
 
@@ -76,12 +77,12 @@ impl BlockBroadcaster {
         info!("Broadcasting worker exited.");
     }
 
-    async fn worker(&mut self) -> Result<(), Error> {
+    async fn worker(&mut self, raft_state: MutexGuard<'_, RaftState>) -> Result<(), Error> {
         tokio::select! {
             _batch_and_client_reply = self.my_block_rx.recv() => {
                 if let Some(_) = _batch_and_client_reply {
                     let (batch, client_reply) = _batch_and_client_reply.unwrap();
-                    self.process_my_block(batch, client_reply).await;
+                    self.process_my_block(batch, client_reply, raft_state).await;
                 }
             }
 
@@ -132,16 +133,15 @@ impl BlockBroadcaster {
         Ok(())
     }
 
-    async fn process_my_block(&mut self, batch: RawBatch, client_reply: Vec<MsgAckChanWithTag>) -> Result<(), Error> {
+    async fn process_my_block(&mut self, batch: RawBatch, client_reply: Vec<MsgAckChanWithTag>, raft_state: MutexGuard<'_, RaftState>) -> Result<(), Error> {
         let config = self.config.get();
-        // TODO: Replace ProtoBlock with simpler Block
         let block = ProtoBlock {
-            n,
+            n: raft_state.log.len() as u64,
             parent: Vec::new(),
-            view: 0,
-            qc: qc_list,
-            fork_validation,
-            view_is_stable: self.view_is_stable,
+            view: raft_state.current_term,
+            qc: vec![],
+            fork_validation: None,
+            view_is_stable: true,
             config_num: self.config_num,
             tx_list: batch,
             sig: None,
@@ -165,12 +165,16 @@ impl BlockBroadcaster {
         for block in &ae_fork {
             cnt += 1;
             let this_is_final_block = cnt == _fork_size;
-            self.store_and_forward_internally(&block, this_is_final_block).await?;
+            self.store_and_forward_internally(block, this_is_final_block).await?;
         }
         // Forward to other nodes. Involves copies and serialization so done last.
+        raft_state.log.push(RaftLogEntry {
+            term: raft_state.current_term,
+            block: block.clone(),
+        });
 
         let names = self.get_everyone_except_me();
-        self.broadcast_ae_fork(names, ae_fork, view, view_is_stable, config_num).await;
+        self.broadcast_ae_fork(names, ae_fork, view, view_is_stable, config_num, raft_state).await;
 
         Ok(())
 
@@ -201,38 +205,42 @@ impl BlockBroadcaster {
 
     }
 
-    async fn broadcast_ae_fork(&mut self, names: Vec<String>, mut ae_fork: Vec<ProtoBlock>, view: u64, view_is_stable: bool, config_num: u64) {        
-        let append_entry = ProtoAppendEntries {
-            fork: Some(ProtoFork {
-                serialized_blocks: ae_fork.drain(..).map(|block| HalfSerializedBlock { 
-                    n: block.block.n,
-                    view: block.block.view,
-                    view_is_stable: block.block.view_is_stable,
-                    config_num: block.block.config_num,
-                    serialized_body: block.block_ser.clone(), 
-                }).collect(),
-            }),
-            commit_index: self.ci,
-            view,
-            view_is_stable,
-            config_num,
-            is_backfill_response: false,
+    async fn broadcast_ae_fork(&mut self, names: Vec<String>, mut ae_fork: Vec<ProtoBlock>, view: u64, view_is_stable: bool, config_num: u64, raft_state: MutexGuard<'_, RaftState>) {        
+        let leader_id = self.config.get().net_config.name.clone();
+
+        let entries = ae_fork.into_iter().map(|block| HalfSerializedBlock {
+            n: block.block.n,
+            view: block.block.view,
+            view_is_stable: block.block.view_is_stable,
+            config_num: block.block.config_num,
+            serialized_body: block.block_ser.clone(),
+        }).collect();
+
+        let prev_log_index = if raft_state.log.len() > 0 {
+            raft_state.log.len() - 1
+        } else {
+            0
         };
-        // let append_entry = ProtoRaftAppendEntries {
-        //     term: view,
-        //     leader_id: self.config.get().net_config.name.clone(), // TODO: Use correct name
-        //     prev_log_index: 0,
-        //     prev_log_term: 0,
-        //     entries: vec![],
-        //     leader_commit: self.ci,
-        // };
+
+        let prev_log_term = if prev_log_index > 0 {
+            raft_state.log[prev_log_index - 1].term
+        } else {
+            0
+        };
+
+        let raft_append_entry = ProtoRaftAppendEntries {
+            term: raft_state.current_term,
+            leader_id,
+            prev_log_index: prev_log_index as u64,
+            prev_log_term,
+            entries,
+            leader_commit: self.ci,
+        };
 
         let rpc = ProtoPayload {
-            message: Some(crate::proto::rpc::proto_payload::Message::AppendEntries(append_entry)),
-            // message: Some(crate::proto::rpc::proto_payload::Message::RaftAppendEntries(append_entry)),
+            message: Some(crate::proto::rpc::proto_payload::Message::RaftAppendEntries(raft_append_entry)),
         };
         let data = rpc.encode_to_vec();
-
         let sz = data.len();
         if !view_is_stable {
             info!("AE size: {} Broadcasting to {:?}", sz, names);

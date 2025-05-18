@@ -32,6 +32,7 @@ impl<S: StorageEngine> RaftStorageService<S> {
 
     pub fn get_connector(&self) -> RaftStorageServiceConnector {
         RaftStorageServiceConnector {
+            cmd_tx: self.cmd_tx.clone(),
         }
     }
 

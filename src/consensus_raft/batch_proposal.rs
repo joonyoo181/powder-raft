@@ -2,12 +2,11 @@ use std::time::Instant;
 use std::{io::Error, pin::Pin, sync::Arc, time::Duration};
 
 use std::io::ErrorKind;
-use log::{info, warn};
+use log::warn;
 use prost::Message as _;
 use crate::config::NodeInfo;
 use crate::proto::client::{ProtoClientReply, ProtoCurrentLeader};
 use crate::proto::execution::ProtoTransactionResult;
-use crate::proto::rpc::ProtoPayload;
 use crate::rpc::server::LatencyProfile;
 use crate::rpc::{PinnedMessage, SenderType};
 use crate::utils::channel::{Sender, Receiver};
@@ -30,7 +29,6 @@ pub struct BatchProposer {
 
     batch_proposer_rx: Receiver<TxWithAckChanTag>,
     block_broadcaster_tx: Sender<(RawBatch, Vec<MsgAckChanWithTag>)>,
-    // block_broadcaster_tx: Sender<(u64, oneshot::Receiver<CachedBlock>)>
 
     reply_tx: Sender<ClientReplyCommand>,
     unlogged_tx: Sender<(ProtoTransaction, oneshot::Sender<ProtoTransactionResult>)>,

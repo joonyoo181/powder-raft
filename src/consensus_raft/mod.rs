@@ -12,7 +12,7 @@ use block_broadcaster::BlockBroadcaster;
 use log::{debug, info, warn};
 use prost::Message;
 use tokio::{sync::{mpsc::unbounded_channel, Mutex}, task::JoinSet};
-use crate::{proto::{checkpoint::ProtoBackfillNack, consensus::{ProtoAppendEntries, ProtoViewChange, ProtoRaftAppendEntries, ProtoRaftAppendEntriesReply}}, rpc::{client::Client, SenderType}, utils::{channel::{make_channel, Receiver, Sender}, RocksDBStorageEngine, RaftStorageService}};
+use crate::{proto::{checkpoint::ProtoBackfillNack, consensus::{ProtoAppendEntries, ProtoRaftAppendEntries, ProtoRaftAppendEntriesReply, ProtoViewChange}, execution::ProtoTransaction}, rpc::{client::Client, SenderType}, utils::{channel::{make_channel, Receiver, Sender}, RaftStorageService, RocksDBStorageEngine}};
 
 use crate::{config::{AtomicConfig, Config}, crypto::{AtomicKeyStore, CryptoService, KeyStore}, proto::rpc::ProtoPayload, rpc::{server::{MsgAckChan, RespType, Server, ServerContextType}, MessageRef}};
 
@@ -125,7 +125,7 @@ pub struct RaftState {
 
 pub struct RaftLogEntry {
     pub term: u64,
-    pub block: ProtoBlock,
+    pub command: ProtoTransaction,
 }
 
 pub struct ConsensusNode {

@@ -1,24 +1,22 @@
-use std::{io::{Error, ErrorKind}, sync::Arc};
+use std::{io::{Error, ErrorKind}, sync::Arc, vec};
 
 use log::{debug, error, info, trace};
 use prost::Message;
 use rustls::crypto;
 use tokio::sync::{oneshot, Mutex};
 
-use crate::{config::AtomicConfig, crypto::{AtomicKeyStore, FutureHash, HashType}, proto::{consensus::{HalfSerializedBlock, ProtoAppendEntries, ProtoBlock, ProtoFork, ProtoRaftAppendEntries}, execution::ProtoTransaction, rpc::ProtoPayload}, rpc::{client::{Client, PinnedClient}, server::LatencyProfile, PinnedMessage, SenderType}, utils::{channel::{Receiver, Sender}, RaftStorageServiceConnector, StorageAck}};
+use crate::{config::AtomicConfig, crypto::{AtomicKeyStore, FutureHash, HashType}, proto::{consensus::{HalfSerializedBlock, ProtoAppendEntries, ProtoBlock, ProtoRaftAppendEntries}, execution::ProtoTransaction, rpc::ProtoPayload}, rpc::{client::{Client, PinnedClient}, server::LatencyProfile, PinnedMessage, SenderType}, utils::{channel::{Receiver, Sender}, RaftStorageServiceConnector, StorageAck}};
 
-use super::app::AppCommand;
+use super::{app::AppCommand, RaftLogEntry};
 use super::batch_proposal::{MsgAckChanWithTag, RawBatch};
 
 pub enum BlockBroadcasterCommand {
     UpdateCI(u64),
-    NextAEForkPrefix(Vec<oneshot::Receiver<Result<ProtoBlock, Error>>>),
 }
 
 pub struct BlockBroadcaster {
     config: AtomicConfig,
     ci: u64,
-    fork_prefix_buffer: Vec<ProtoBlock>,
     
     // Input ports
     my_block_rx: Receiver<(RawBatch, Vec<MsgAckChanWithTag>)>,
@@ -52,7 +50,6 @@ impl BlockBroadcaster {
         Self {
             config,
             ci: 0,
-            fork_prefix_buffer: Vec::new(),
             my_block_rx,
             control_command_rx,
             storage,
@@ -114,12 +111,6 @@ impl BlockBroadcaster {
     async fn handle_control_command(&mut self, cmd: BlockBroadcasterCommand) -> Result<(), Error> {
         match cmd {
             BlockBroadcasterCommand::UpdateCI(ci) => self.ci = ci,
-            BlockBroadcasterCommand::NextAEForkPrefix(blocks) => {
-                for block in blocks {
-                    let block = block.await.unwrap().expect("Failed to get block");
-                    self.fork_prefix_buffer.push(block);
-                }
-            }
         }
 
         Ok(())
@@ -129,55 +120,25 @@ impl BlockBroadcaster {
         // Store
         let storage_ack = self.storage.put_block(block).await;
         // info!("Sending {}", block.block.n);
-        self.staging_tx.send((block.clone(), storage_ack, ae_stats, this_is_final_block)).await.unwrap();
+        self.staging_tx.send((block.clone(), storage_ack, this_is_final_block)).await.unwrap();
         Ok(())
     }
 
     async fn process_my_block(&mut self, batch: RawBatch, client_reply: Vec<MsgAckChanWithTag>, raft_state: MutexGuard<'_, RaftState>) -> Result<(), Error> {
-        let config = self.config.get();
-        let block = ProtoBlock {
-            n: raft_state.log.len() as u64,
-            parent: Vec::new(),
-            view: raft_state.current_term,
-            qc: vec![],
-            fork_validation: None,
-            view_is_stable: true,
-            config_num: self.config_num,
-            tx_list: batch,
-            sig: None,
-        };
-        
-        let (view, config_num) = (block.view, block.config_num);
-        // First forward all blocks that were in the fork prefix buffer.
-        let mut ae_fork = Vec::new();
-
-        for block in self.fork_prefix_buffer.drain(..) {
-            ae_fork.push(block);
-        }
-        ae_fork.push(block.clone());
-
-        if ae_fork.len() > 1 {
-            trace!("AE: {:?}", ae_fork);
+        let new_entries = Vec::new();
+        for xact in batch {
+            new_entries.push(RaftLogEntry {
+                term: raft_state.current_term,
+                command: xact.clone(),
+            });
         }
 
-        let _fork_size = ae_fork.len();
-        let mut cnt = 0;
-        for block in &ae_fork {
-            cnt += 1;
-            let this_is_final_block = cnt == _fork_size;
-            self.store_and_forward_internally(block, this_is_final_block).await?;
-        }
-        // Forward to other nodes. Involves copies and serialization so done last.
-        raft_state.log.push(RaftLogEntry {
-            term: raft_state.current_term,
-            block: block.clone(),
-        });
+        raft_state.log.extend(new_entries.clone());
 
         let names = self.get_everyone_except_me();
-        self.broadcast_ae_fork(names, ae_fork, view, view_is_stable, config_num, raft_state).await;
+        self.broadcast_ae(names, raft_state, new_entries).await;
 
         Ok(())
-
     }
 
     fn get_broadcast_threshold(&self) -> usize {
@@ -205,25 +166,12 @@ impl BlockBroadcaster {
 
     }
 
-    async fn broadcast_ae_fork(&mut self, names: Vec<String>, mut ae_fork: Vec<ProtoBlock>, view: u64, view_is_stable: bool, config_num: u64, raft_state: MutexGuard<'_, RaftState>) {        
-        let leader_id = self.config.get().net_config.name.clone();
+    async fn broadcast_ae(&mut self, names: Vec<String>, raft_state: MutexGuard<'_, RaftState>, new_entries: Vec<RaftLogEntry>) {        
+        let leader_id = self.config.get().consensus_config.get_leader_for_view(raft_state.current_term);
 
-        let entries = ae_fork.into_iter().map(|block| HalfSerializedBlock {
-            n: block.block.n,
-            view: block.block.view,
-            view_is_stable: block.block.view_is_stable,
-            config_num: block.block.config_num,
-            serialized_body: block.block_ser.clone(),
-        }).collect();
-
-        let prev_log_index = if raft_state.log.len() > 0 {
-            raft_state.log.len() - 1
-        } else {
-            0
-        };
-
-        let prev_log_term = if prev_log_index > 0 {
-            raft_state.log[prev_log_index - 1].term
+        let prev_log_index = max(raft_state.log.len() - new_entries.len(), 0);
+        let prev_log_term = if raft_state.log.len() > 0 {
+            raft_state.log[prev_log_index].term
         } else {
             0
         };
@@ -233,7 +181,7 @@ impl BlockBroadcaster {
             leader_id,
             prev_log_index: prev_log_index as u64,
             prev_log_term,
-            entries,
+            entries: new_entries.clone(),
             leader_commit: self.ci,
         };
 
@@ -242,12 +190,9 @@ impl BlockBroadcaster {
         };
         let data = rpc.encode_to_vec();
         let sz = data.len();
-        if !view_is_stable {
-            info!("AE size: {} Broadcasting to {:?}", sz, names);
-        }
         let data = PinnedMessage::from(data, sz, SenderType::Anon);
         let mut profile = LatencyProfile::new();
-        let _res = PinnedClient::broadcast(&self.client, &names, &data, &mut profile, get_broadcast_threshold()).await;
+        let _res = PinnedClient::broadcast(&self.client, &names, &data, &mut profile, self.get_broadcast_threshold()).await;
 
     }
 }

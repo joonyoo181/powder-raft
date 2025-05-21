@@ -4,7 +4,8 @@ use bytes::BytesMut;
 use ed25519_dalek::SIGNATURE_LENGTH;
 use prost::{DecodeError, EncodeError, Message};
 
-use crate::{crypto::{HashType, DIGEST_LENGTH}, proto::consensus::{DefferedSignature, ProtoBlock}};
+use crate::{crypto::{HashType, DIGEST_LENGTH}, proto::consensus::{DefferedSignature, ProtoBlock}, proto::consensus_raft::batch_proposal::RawBatch};
+use crate::proto::execution::{ProtoRawBatch};
 
 pub fn serialize_proto_block_nascent(block: &ProtoBlock) -> Result<Vec<u8>, Error> {
     let mut bytes = BytesMut::with_capacity(DIGEST_LENGTH + SIGNATURE_LENGTH + block.encoded_len());
@@ -26,6 +27,18 @@ pub fn serialize_proto_block_nascent(block: &ProtoBlock) -> Result<Vec<u8>, Erro
     // bytes.extend_from_slice(&bitcode::encode(block));
 
     Ok(bytes.to_vec())
+}
+
+pub fn serialize_raw_batch(batch: &RawBatch) -> Result<Vec<u8>, Error> {
+    let proto_batch: ProtoRawBatch = batch.clone().into();
+    let mut bytes = BytesMut::with_capacity(proto_batch.encoded_len());
+    proto_batch.encode(&mut bytes).unwrap();
+    Ok(bytes.to_vec())
+}
+
+pub fn deserialize_raw_batch(bytes: &[u8]) -> Result<RawBatch, DecodeError> {
+    let proto_batch = ProtoRawBatch::decode(bytes).unwrap();
+    Ok(proto_batch.into())
 }
 
 pub fn serialize_proto_block_prefilled(mut block: ProtoBlock) -> Vec<u8> {

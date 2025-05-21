@@ -1,14 +1,11 @@
 use std::io::Error;
 
 use tokio::sync::oneshot;
-
-use crate::crypto::HashType;
-
 use super::{channel::{make_channel, Receiver, Sender}, StorageEngine};
 
 enum RaftStorageServiceCommand {
-    Put(HashType /* key */, Vec<u8> /* val */, oneshot::Sender<Result<(), Error>>),
-    Get(HashType /* key */, oneshot::Sender<Result<Vec<u8>, Error>>)
+    Put(u64 /* key */, Vec<u8> /* val */, oneshot::Sender<Result<(), Error>>),
+    Get(u64 /* key */, oneshot::Sender<Result<Vec<u8>, Error>>)
 }
 
 pub struct RaftStorageService<S: StorageEngine> {
@@ -63,29 +60,23 @@ impl<S: StorageEngine> RaftStorageService<S> {
 pub type StorageAck = Result<(), Error>;
 
 impl RaftStorageServiceConnector {
-    pub async fn get_block(&mut self, block_hash: &HashType) -> Result<ProtoBlock, Error> {
+    pub async fn get_block(&mut self, starting_sequence: u64) -> Result<RawBatch, Error> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(RaftStorageServiceCommand::Get(block_hash.clone(), tx)).await.unwrap();
+        self.cmd_tx.send(RaftStorageServiceCommand::Get(starting_sequence, tx)).await.unwrap();
+
+        let res = rx.await.unwrap();
+        if let Err(e) = res {
+            Err(e);
+        }
+        let batch_ser = res.unwrap();
+        let batch = deserialize_raw_batch(batch_ser.as_ref());
+        Ok(batch);
     }
 
-    pub async fn put_block(&self, block: &ProtoBlock) -> oneshot::Receiver<StorageAck> {
+    pub async fn put_block(&self, batch: &RawBatch) -> oneshot::Receiver<StorageAck> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(RaftStorageServiceCommand::Put(block.block_hash.clone(), block.block_ser.clone(), tx)).await.unwrap();
+        self.cmd_tx.send(RaftStorageServiceCommand::Put(batch.starting_sequence, serialize_raw_batch(&batch), tx)).await.unwrap();
 
         rx
-    }
-
-    pub async fn put_raw(&self, key: String, val: Vec<u8>) -> oneshot::Receiver<StorageAck> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(RaftStorageServiceCommand::Put(key.into_bytes(), val, tx)).await.unwrap();
-
-        rx
-    }
-
-    pub async fn get_raw(&self, key: String) -> Result<Vec<u8>, Error> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(RaftStorageServiceCommand::Get(key.into_bytes(), tx)).await.unwrap();
-
-        rx.await.unwrap()
     }
 }

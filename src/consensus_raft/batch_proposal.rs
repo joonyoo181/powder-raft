@@ -6,7 +6,7 @@ use log::warn;
 use prost::Message as _;
 use crate::config::NodeInfo;
 use crate::proto::client::{ProtoClientReply, ProtoCurrentLeader};
-use crate::proto::execution::ProtoTransactionResult;
+use crate::proto::execution::{ProtoTransactionResult, ProtoRawBatch};
 use crate::rpc::server::LatencyProfile;
 use crate::rpc::{PinnedMessage, SenderType};
 use crate::utils::channel::{Sender, Receiver};
@@ -14,7 +14,31 @@ use tokio::sync::{oneshot, Mutex};
 
 use crate::{config::AtomicConfig, utils::timer::ResettableTimer, proto::execution::ProtoTransaction, rpc::server::MsgAckChan};
 use super::client_reply::ClientReplyCommand;
-pub type RawBatch = Vec<ProtoTransaction>;
+
+
+pub struct RawBatch {
+    pub transactions: Vec<ProtoTransaction>,
+    pub starting_sequence: u64,
+}
+
+impl From<&RawBatch> for ProtoRawBatch {
+    fn from(batch: &RawBatch) -> Self {
+        ProtoRawBatch {
+            starting_sequence: batch.starting_sequence,
+            transactions: batch.transactions.clone(),
+        }
+    }
+}
+
+impl From<ProtoRawBatch> for RawBatch {
+    fn from(proto: ProtoRawBatch) -> Self {
+        RawBatch {
+            starting_sequence: proto.starting_sequence,
+            transactions: proto.transactions,
+        }
+    }
+}
+
 
 pub type MsgAckChanWithTag = (MsgAckChan, u64 /* client tag */, SenderType /* client name */);
 pub type TxWithAckChanTag = (Option<ProtoTransaction>, MsgAckChanWithTag);
@@ -34,6 +58,7 @@ pub struct BatchProposer {
     unlogged_tx: Sender<(ProtoTransaction, oneshot::Sender<ProtoTransactionResult>)>,
 
     current_raw_batch: Option<RawBatch>, // So that I can take()
+    next_sequence: u64,
     current_reply_vec: Vec<MsgAckChanWithTag>,
     batch_timer: Arc<Pin<Box<ResettableTimer>>>,
 
@@ -62,11 +87,17 @@ impl BatchProposer {
             "Propose batch"
         ];
 
+        let init_batch = RawBatch {
+            transactions: Vec::with_capacity(max_batch_size),
+            starting_sequence: 0,
+        };
+
         #[allow(unused_mut)]
         let mut ret = Self {
             config,
             batch_proposer_rx, block_broadcaster_tx,
-            current_raw_batch: Some(RawBatch::with_capacity(max_batch_size)),
+            current_raw_batch: Some(init_batch),
+            next_sequence: 0,
             batch_timer,
             current_reply_vec: Vec::with_capacity(max_batch_size),
             reply_tx, unlogged_tx,
@@ -158,13 +189,13 @@ impl BatchProposer {
             let ack_chan = new_tx.1;
             let new_tx = new_tx.0.unwrap();
 
-            self.current_raw_batch.as_mut().unwrap().push(new_tx);
+            self.current_raw_batch.as_mut().unwrap().transactions.push(new_tx);
             self.current_reply_vec.push(ack_chan);
         }
 
         let max_batch_size = self.config.get().consensus_config.max_backlog_batch_size;
 
-        if self.current_raw_batch.as_ref().unwrap().len() >= max_batch_size || (self.make_new_batches && batch_timer_tick) {
+        if self.current_raw_batch.as_ref().unwrap().transactions.len() >= max_batch_size || (self.make_new_batches && batch_timer_tick) {
             self.propose_new_batch().await;
         }
 
@@ -197,9 +228,12 @@ impl BatchProposer {
     async fn propose_new_batch(&mut self) {
         self.last_batch_proposed = Instant::now();
         let batch = self.current_raw_batch.take().unwrap();
-        self.current_raw_batch = Some(RawBatch::with_capacity(
-            self.config.get().consensus_config.max_backlog_batch_size
-        ));
+        let new_batch = RawBatch {
+            transactions: Vec::with_capacity(self.config.get().consensus_config.max_backlog_batch_size),
+            starting_sequence: self.next_sequence,
+        };
+        self.next_sequence += batch.transactions.len() as u64;
+        self.current_raw_batch = Some(new_batch);
         let reply_chans = self.current_reply_vec.drain(..).collect();
         let _ = self.block_broadcaster_tx.send((batch, reply_chans)).await;
         self.batch_timer.reset();

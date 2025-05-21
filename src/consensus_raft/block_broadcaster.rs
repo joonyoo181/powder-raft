@@ -5,7 +5,7 @@ use prost::Message;
 use rustls::crypto;
 use tokio::sync::{oneshot, Mutex};
 
-use crate::{config::AtomicConfig, crypto::{AtomicKeyStore, FutureHash, HashType}, proto::{consensus::{HalfSerializedBlock, ProtoAppendEntries, ProtoBlock, ProtoRaftAppendEntries}, execution::ProtoTransaction, rpc::ProtoPayload}, rpc::{client::{Client, PinnedClient}, server::LatencyProfile, PinnedMessage, SenderType}, utils::{channel::{Receiver, Sender}, RaftStorageServiceConnector, StorageAck}};
+use crate::{config::AtomicConfig, crypto::{AtomicKeyStore, FutureHash, HashType}, proto::{consensus_raft::{ProtoRaftAppendEntries}, execution::ProtoTransaction, rpc::ProtoPayload}, rpc::{client::{Client, PinnedClient}, server::LatencyProfile, PinnedMessage, SenderType}, utils::{channel::{Receiver, Sender}, RaftStorageServiceConnector, StorageAck}};
 
 use super::{app::AppCommand, RaftLogEntry};
 use super::batch_proposal::{MsgAckChanWithTag, RawBatch};
@@ -25,7 +25,7 @@ pub struct BlockBroadcaster {
     // Output ports
     storage: RaftStorageServiceConnector,
     client: PinnedClient,
-    staging_tx: Sender<(ProtoBlock, oneshot::Receiver<StorageAck>, bool /* this_is_final_block */)>,
+    staging_tx: Sender<(RawBatch, oneshot::Receiver<StorageAck>)>,
 }
 
 impl BlockBroadcaster {
@@ -35,7 +35,7 @@ impl BlockBroadcaster {
         my_block_rx: Receiver<(RawBatch, Vec<MsgAckChanWithTag>)>,
         control_command_rx: Receiver<BlockBroadcasterCommand>,
         storage: RaftStorageServiceConnector,
-        staging_tx: Sender<(ProtoBlock, oneshot::Receiver<StorageAck>, bool)>,
+        staging_tx: Sender<(RawBatch, oneshot::Receiver<StorageAck>)>,
     ) -> Self {
 
         let my_block_event_order = vec![
@@ -116,17 +116,15 @@ impl BlockBroadcaster {
         Ok(())
     }
 
-    async fn store_and_forward_internally(&mut self, block: &ProtoBlock, this_is_final_block: bool) -> Result<(), Error> {
-        // Store
-        let storage_ack = self.storage.put_block(block).await;
-        // info!("Sending {}", block.block.n);
-        self.staging_tx.send((block.clone(), storage_ack, this_is_final_block)).await.unwrap();
+    async fn store_and_forward_internally(&mut self, batch: &RawBatch) -> Result<(), Error> {
+        let storage_ack = self.storage.put_block(batch).await;
+        self.staging_tx.send((batch.clone(), storage_ack)).await.unwrap();
         Ok(())
     }
 
     async fn process_my_block(&mut self, batch: RawBatch, client_reply: Vec<MsgAckChanWithTag>, raft_state: MutexGuard<'_, RaftState>) -> Result<(), Error> {
         let new_entries = Vec::new();
-        for xact in batch {
+        for xact in batch.transactions {
             new_entries.push(RaftLogEntry {
                 term: raft_state.current_term,
                 command: xact.clone(),
@@ -134,6 +132,7 @@ impl BlockBroadcaster {
         }
 
         raft_state.log.extend(new_entries.clone());
+        self.store_and_forward_internally(&batch).await?;
 
         let names = self.get_everyone_except_me();
         self.broadcast_ae(names, raft_state, new_entries).await;
